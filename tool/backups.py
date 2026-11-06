@@ -24,6 +24,14 @@ class Backups:
             return None
         return os.path.join(self.root, hits[-1]) if hits else None
 
+    def all(self, model):
+        """这个型号的全部备份目录，按 latest() 的顺序倒过来（最近的在前）。"""
+        try:
+            hits = sorted((d for d in os.listdir(self.root) if d.startswith(model + "-")), reverse=True)
+        except FileNotFoundError:
+            return []
+        return [os.path.join(self.root, d) for d in hits]
+
     def create(self, model, when=None):
         d = os.path.join(self.root, f"{model}-{(when or datetime.datetime.now()):%Y%m%d-%H%M}")
         os.makedirs(d, exist_ok=True)
