@@ -38,6 +38,13 @@ object Native {
         Toast.makeText(app, "已复制", Toast.LENGTH_SHORT).show()
     }
 
+    /** 引擎往输入框里写中文：先放进剪贴板，再发粘贴键（读屏不经选择器写字）。 */
+    @JvmStatic
+    fun setClipboard(text: String) {
+        val cm = app.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("安卓去广告", text))
+    }
+
     @JvmStatic
     fun toast(text: String) = main.post { Toast.makeText(app, text, Toast.LENGTH_LONG).show() }
 

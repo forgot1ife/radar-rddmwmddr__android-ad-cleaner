@@ -14,7 +14,6 @@ import time
 _run = subprocess.run
 _popen = subprocess.Popen
 
-U2_PORT = 9008
 SLOW = 3.0
 
 
@@ -84,8 +83,17 @@ class ShizukuBridge:
     def stop_daemon(self, name):
         self.shell.stopDaemon(name)
 
-    def server_port(self):
-        return U2_PORT
+    def dump(self, display):
+        """读屏：命令服务经 UiAutomation 读第 display 块屏的窗口，返回 XML（读不到为空串）。"""
+        return str(self.shell.dump(display))
+
+    def size(self, display):
+        w, h = (str(self.shell.size(display)).split() + ["0", "0"])[:2]
+        return int(w), int(h)
+
+    def set_clipboard(self, text):
+        from java import jclass
+        jclass("com.ahuamiao.adcleaner.Native").setClipboard(text)
 
 
 class AdbBridge:
@@ -94,7 +102,6 @@ class AdbBridge:
     def __init__(self, adb, serial):
         self.adb, self.serial = adb, serial
         self.daemons = {}
-        self.port = None
 
     def ready(self):
         r = _run([self.adb, "-s", self.serial, "get-state"], capture_output=True, text=True, timeout=10)
@@ -122,12 +129,18 @@ class AdbBridge:
         if p is not None:
             p.kill()
 
-    def server_port(self):
-        if self.port is None:
-            out = _run([self.adb, "-s", self.serial, "forward", "tcp:0", f"tcp:{U2_PORT}"],
-                       capture_output=True, text=True, timeout=10).stdout
-            self.port = int(out.strip())
-        return self.port
+    def dump(self, display):
+        """电脑调试：系统自带的 uiautomator dump 只读主屏（后台屏要在手机上的命令服务里读）。"""
+        r = self.exec("uiautomator dump /data/local/tmp/aac-dump.xml >/dev/null && cat /data/local/tmp/aac-dump.xml", None, 30)
+        return r.out.decode("utf-8", "replace") if r.code == 0 else ""
+
+    def size(self, display):
+        out = self.exec("wm size", None, 10).out.decode()
+        w, h = map(int, (re.findall(r"(\d+)x(\d+)", out) or [("0", "0")])[-1])
+        return w, h
+
+    def set_clipboard(self, text):
+        print(f"[clipboard] {text}", file=sys.__stderr__)
 
 
 _bridge = None

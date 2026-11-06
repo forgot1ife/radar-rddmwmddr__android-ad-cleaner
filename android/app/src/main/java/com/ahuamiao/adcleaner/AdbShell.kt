@@ -4,15 +4,11 @@ import android.content.Context
 import android.os.Build
 import io.github.muntashirakon.adb.AdbStream
 import io.github.muntashirakon.adb.android.AdbMdns
-import java.io.DataInputStream
-import java.nio.ByteBuffer
 import kotlin.concurrent.thread
 
 /**
- * 内置无线调试的命令通道（#622），与 ShizukuShell 同一组接口：submit 返回 Job，Python 侧轮询。
- *
- * 连上本机 adbd 后只开一条常驻 `exec:` 流，跑本 APK 里的 ShellServer（shell 身份），所有命令按编号经它收发，
- * 分得开 stdout / stderr、带回退出码。不给每条命令单开 adb 流：libadb 在对端关流时有竞态，
+ * 内置无线调试（#622）：配对、连本机 adbd，再开一条常驻 `exec:` 流跑本 APK 里的 ShellServer（shell 身份），
+ * 之后所有命令与读屏都经 ServerClient 收发。不给每条命令单开 adb 流：libadb 在对端关流时有竞态，
  * 模拟器上小命令会丢掉全部输出和退出码。
  */
 object AdbShell {
@@ -60,10 +56,10 @@ object AdbShell {
     private fun grantSelf() {
         thread(isDaemon = true) {
             try {
-                submit("pm grant ${app.packageName} android.permission.WRITE_SECURE_SETTINGS", null).let { job ->
-                    val deadline = System.currentTimeMillis() + 10_000
-                    while (!job.isDone() && System.currentTimeMillis() < deadline) Thread.sleep(50)
-                }
+                client().request(1, run {
+                    val cmd = "pm grant ${app.packageName} android.permission.WRITE_SECURE_SETTINGS".toByteArray()
+                    java.nio.ByteBuffer.allocate(8 + cmd.size).putInt(cmd.size).put(cmd).putInt(0).array()
+                }).await(10_000)
             } catch (_: Throwable) {
             }
         }
@@ -83,112 +79,22 @@ object AdbShell {
         return ok
     }
 
-    // ----- 命令服务：一条常驻流，所有命令都经它（见 ShellServer.java）-----
-    private var server: AdbStream? = null
-    private var output: java.io.OutputStream? = null
-    private val pending = java.util.concurrent.ConcurrentHashMap<Int, Job>()
-    private val nextId = java.util.concurrent.atomic.AtomicInteger(1)
+    // ----- 命令服务：一条常驻 exec: 流跑 ShellServer，所有命令、读屏都经它 -----
+    private var client: ServerClient? = null
 
-    /** 起命令服务（已在跑就直接用）：经 exec: 流以 shell 身份跑本 APK 里的 ShellServer，等它报「ready」。 */
+    @JvmStatic
     @Synchronized
-    private fun ensureServer(): AdbStream {
-        server?.let { if (!it.isClosed) return it }
-        val apk = app.applicationInfo.sourceDir
-        // exec: 流里 stderr 与 stdout 混在一起，会打乱二进制协议：stderr 丢掉
-        val stream = AdbManager.get(app).openStream(
-            "exec:CLASSPATH=$apk exec app_process / com.ahuamiao.adcleaner.ShellServer 2>/dev/null")
-        val ready = java.util.concurrent.CountDownLatch(1)
-        thread(isDaemon = true) {
-            try {
-                val input = DataInputStream(stream.openInputStream())
-                while (true) {
-                    val id = input.readInt()
-                    val code = input.readInt()
-                    val o = ByteArray(input.readInt()).also { input.readFully(it) }
-                    val e = ByteArray(input.readInt()).also { input.readFully(it) }
-                    if (id == 0) ready.countDown() else pending.remove(id)?.complete(code, o, e)
-                }
-            } catch (e: Exception) {
-                android.util.Log.w("AacAdb", "命令服务断开：$e")
-            } finally {
-                synchronized(this) { if (server === stream) server = null }
-                pending.values.toList().forEach { it.complete(-1, ByteArray(0), "命令服务断开".toByteArray()) }
-                pending.clear()
-            }
+    fun client(): ServerClient {
+        client?.let { if (!it.closed) return it }
+        val stream: AdbStream = AdbManager.get(app).openStream("exec:" + ServerClient.command(app.applicationInfo.sourceDir))
+        val c = ServerClient(stream.openInputStream(), stream.openOutputStream()) {
+            synchronized(this) { if (client?.closed == true) client = null }
         }
-        output = stream.openOutputStream()
-        server = stream
-        if (!ready.await(15, java.util.concurrent.TimeUnit.SECONDS)) {
+        if (!c.awaitReady(15_000)) {
             stream.close()
             throw java.io.IOException("命令服务没有启动")
         }
-        return stream
-    }
-
-    /** 发一条请求：整包一次写出（每次 write 都要等对端回 OKAY，拆开写会慢）。 */
-    private fun send(id: Int, type: Int, body: ByteArray) {
-        ensureServer()
-        val buf = ByteBuffer.allocate(9 + body.size).putInt(id).put(type.toByte()).putInt(body.size).put(body).array()
-        synchronized(this) {
-            output!!.write(buf)
-            output!!.flush()
-        }
-    }
-
-    private fun field(data: ByteArray): ByteArray = ByteBuffer.allocate(4 + data.size).putInt(data.size).put(data).array()
-
-    class Job internal constructor() : ShellJob {
-        @Volatile private var finished = false
-        @Volatile private var code = -1
-        @Volatile private var out = ByteArray(0)
-        @Volatile private var err = ByteArray(0)
-
-        fun complete(code: Int, out: ByteArray, err: ByteArray) {
-            this.code = code; this.out = out; this.err = err
-            finished = true
-        }
-
-        override fun isDone(): Boolean = finished
-        override fun result(timedOut: Boolean) = ShizukuShell.Result(code, out, err, timedOut)
-
-        /** 超时：不再等它（服务那头的进程跑完会自己回，回了也没人收）。 */
-        override fun cancel() {
-            finished = true
-        }
-    }
-
-    @JvmStatic
-    fun submit(cmd: String, stdin: ByteArray?): ShellJob {
-        val job = Job()
-        val id = nextId.getAndIncrement()
-        pending[id] = job
-        try {
-            send(id, 1, field(cmd.toByteArray()) + field(stdin ?: ByteArray(0)))
-        } catch (e: Exception) {
-            pending.remove(id)
-            job.complete(-1, ByteArray(0), "命令服务不可用：$e".toByteArray())
-        }
-        return job
-    }
-
-    /** 常驻进程（读屏服务、后台屏）：交给命令服务起，名字相同且还活着就不再起。 */
-    @JvmStatic
-    fun daemon(name: String, cmd: String): Boolean {
-        val job = Job()
-        val id = nextId.getAndIncrement()
-        pending[id] = job
-        send(id, 2, field(name.toByteArray()) + cmd.toByteArray())
-        return true
-    }
-
-    @JvmStatic
-    fun stopDaemon(name: String) {
-        if (server == null) return
-        val id = nextId.getAndIncrement()
-        pending[id] = Job()
-        try {
-            send(id, 3, name.toByteArray())
-        } catch (_: Exception) {
-        }
+        client = c
+        return c
     }
 }

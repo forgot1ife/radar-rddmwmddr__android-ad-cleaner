@@ -3,13 +3,13 @@ package com.ahuamiao.adcleaner
 /** 一条在跑的命令：Python 侧轮询 isDone()，超时自己 cancel()，结束后取 result()。 */
 interface ShellJob {
     fun isDone(): Boolean
-    fun result(timedOut: Boolean): ShizukuShell.Result
+    fun result(timedOut: Boolean): ShellResult
     fun cancel()
 }
 
 /**
- * 以 shell 身份执行命令的门面，Python 只认这一个类（aac_android/bridge.py）。
- * 两条路：用户装了并授权了 Shizuku 就用 Shizuku；否则用内置无线调试（#622），不用另装 App。
+ * 以 shell 身份执行命令、读屏的门面，Python 只认这一个类（aac_android/bridge.py、u2.py）。
+ * 两条路起的是同一个命令服务（ShellServer）：装了并授权 Shizuku 就经 Shizuku 起，否则经内置无线调试（#622）。
  */
 object Shell {
     @JvmStatic
@@ -22,17 +22,34 @@ object Shell {
     @JvmStatic
     fun ready(): Boolean = backend().isNotEmpty()
 
-    @JvmStatic
-    fun submit(cmd: String, stdin: ByteArray?): ShellJob =
-        if (ShizukuShell.ready()) ShizukuShell.submit(cmd, stdin) else AdbShell.submit(cmd, stdin)
+    private fun client(): ServerClient = if (ShizukuShell.ready()) ShizukuShell.client() else AdbShell.client()
 
     @JvmStatic
-    fun daemon(name: String, cmd: String): Boolean =
-        if (ShizukuShell.ready()) ShizukuShell.daemon(name, cmd) else AdbShell.daemon(name, cmd)
+    fun submit(cmd: String, stdin: ByteArray?): ShellJob = try {
+        client().submit(cmd, stdin)
+    } catch (e: Exception) {
+        ServerClient.Job().apply { complete(-1, ByteArray(0), "命令服务不可用：$e".toByteArray()) }
+    }
+
+    @JvmStatic
+    fun daemon(name: String, cmd: String): Boolean {
+        client().daemon(name, cmd)
+        return true
+    }
 
     @JvmStatic
     fun stopDaemon(name: String) {
-        ShizukuShell.stopDaemon(name)
-        AdbShell.stopDaemon(name)
+        try {
+            client().stopDaemon(name)
+        } catch (_: Exception) {
+        }
     }
+
+    /** 读屏（-1 = 所有屏）：与 uiautomator 同格式的 XML；读不到返回空串。 */
+    @JvmStatic
+    fun dump(display: Int): String = client().dump(display)?.takeIf { it.code == 0 }?.out?.toString(Charsets.UTF_8) ?: ""
+
+    /** 某块屏的「宽 高」（随旋转）；读不到返回空串。 */
+    @JvmStatic
+    fun size(display: Int): String = client().size(display)?.takeIf { it.code == 0 }?.out?.toString(Charsets.UTF_8) ?: ""
 }

@@ -10,7 +10,7 @@
 |---|---|
 | `subprocess.run([adb, "-s", 序列号, "shell", …])` | `adb.py` 接管 subprocess，adb 占位文件的调用按 adb 语义回答，命令经 Shizuku 执行（`bridge.py` → Kotlin `ShizukuShell`） |
 | 每一步一个 Python 子进程 | `inproc.py` 在本进程线程里跑脚本：每步清掉 `tool/` 模块、换环境变量、按线程分流输出、`SystemExit` 当退出码 |
-| `uiautomator2` / `adbutils` / `tool/ui_session.py` | `u2.py`：同一个 `u2.jar` 经 Shizuku 以 shell 身份启动，App 直连本机 9008 端口发 jsonrpc |
+| `uiautomator2` / `adbutils` / `tool/ui_session.py` | `u2.py`：读屏走本 App 的 `ShellServer`（shell 身份连 UiAutomation，读所有屏的窗口），点按走 `input`，不开网络端口 |
 
 界面经 WebView 加载 `index.html`；`assets/mobile/mobile.js` 补上 `pywebview` 桥，把首页换成 Shizuku 状态和「一键去广告」（自动走检测 → 扫描 → 开始执行，勾选与桌面版默认一致）。
 
@@ -25,7 +25,7 @@
 
 - `AdbManager`：App 私有目录存 RSA 密钥与自签证书；经 mDNS 找无线调试的配对 / 连接端口，只连本机 `127.0.0.1`。
 - 配对：码填在通知栏输入框（`Pairing`），用户不用离开系统的配对对话框。提交时 App 被唤醒，当场找配对端口再配——小米 HyperOS 会冻结后台 App，不能一直在后台等端口。
-- 命令：连上后只开一条常驻 `exec:` 流，跑 APK 里的 `ShellServer`（shell 身份），所有命令按编号经它收发。不给每条命令单开 adb 流：libadb 在对端关流时有竞态，小命令会丢输出和退出码。
+- 命令与读屏：连上后只开一条常驻 `exec:` 流，跑 APK 里的 `ShellServer`（shell 身份），所有命令、读屏按编号经它收发（`ServerClient`；Shizuku 那条路起的是同一个服务）。读屏用 UiAutomation，不开网络端口——以前借用的 u2.jar 读屏服务在 9008 端口对局域网开放、无鉴权（#623）。不给每条命令单开 adb 流：libadb 在对端关流时有竞态，小命令会丢输出和退出码。
 - 首次连上后经 shell 给本 App 授 `WRITE_SECURE_SETTINGS`：之后无线调试被关（重启、换 Wi-Fi）时 App 自己打开、重连。第一次在某个网络上打开无线调试，系统会弹「允许在此网络上使用无线调试」，勾「始终允许」后才能免确认。
 - 选择：Shizuku 已授权就用 Shizuku，否则用内置无线调试（`Shell`）；Python 侧不感知。
 
@@ -45,10 +45,9 @@
 android/build.sh assembleRelease
 ```
 
-构建前会把 `tool/`、`recipes/`（不含 `zztest-*`）、`gui/app.py`、`gui/web/`、教程图和 `u2.jar` 同步进 assets。版本号读 `gui/app.py` 的 `VERSION`。
+构建前会把 `tool/`、`recipes/`（不含 `zztest-*`）、`gui/app.py`、`gui/web/` 和教程图同步进 assets。版本号读 `gui/app.py` 的 `VERSION`。
 
 - 需要 JDK 17、Android SDK、gradle 8.10.2，以及本机的 Python 3.12（Chaquopy 编译用，路径在 `app/build.gradle.kts`）。
-- `u2.jar` 取自 `gui/.venv` 里装的 uiautomator2 3.7.1：先按客户端的说明装好 `gui/.venv`。
 - 正式签名读 `.private/android-signing/keystore.properties`，没有就退回 debug 签名。证书丢了，已安装的 App 就没法覆盖更新。
 
 ## 在电脑上调试替换层
